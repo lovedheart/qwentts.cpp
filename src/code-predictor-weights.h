@@ -28,11 +28,15 @@
 #include "talker-weights.h"
 #include "weight-ctx.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
+
+// ggml_fp16_t is uint16_t; alias here so the weights header is self-contained
+using cp_fp16_t = uint16_t;
 
 struct CodePredictorWeights {
     int   hidden_size;
@@ -64,6 +68,23 @@ struct CodePredictorWeights {
 
     struct ggml_context * weight_ctx;
     ggml_backend_buffer_t weight_buf;
+
+    // CPU mirror of the acoustic codec embedding tables. Loaded once at
+    // init time so that code_predictor_step can read embedding rows
+    // without GPU→CPU round-trips. Each table is [vocab_size, hidden]
+    // F32 row-major. Total: num_acoustic × vocab × hidden × 4 bytes
+    // (~120 MB for 15 × 2048 × 1024).
+    std::vector<std::vector<float>> embed_host;
+
+    // Pre-computed causal masks for T_full = 2..16 (the predictor cache
+    // max). Masks are stored as F16, indexed by T_full-2 so mask[0] is
+    // the 2×2 prefill mask and mask[14] is the 16×16 final decode mask.
+    // Each entry is a flat [T_full × T_full] F16 buffer (cp_fp16_t = uint16_t).
+    std::vector<std::vector<cp_fp16_t>> causal_masks;
+
+    // Pre-allocated context buffer for code_predictor_run. Reused across
+    // calls to avoid malloc/free overhead in ggml_init.
+    std::vector<uint8_t> ctx_buffer;
 };
 
 static bool code_predictor_weights_load(CodePredictorWeights * cw, const GGUFModel & gf, ggml_backend_t backend) {
@@ -157,12 +178,73 @@ static bool code_predictor_weights_load(CodePredictorWeights * cw, const GGUFMod
     cw->weight_ctx = wctx.ctx;
     cw->weight_buf = wctx.buffer;
 
+    // Pre-load acoustic codec embedding tables to CPU. Each table is
+    // stored as [hidden, vocab] in GGML (ne[0]=hidden, ne[1]=vocab).
+    // We read the full tensor via ggml_backend_tensor_get, handling
+    // quantized types by reading raw bytes then dequantizing per row.
+    // This eliminates 15 synchronous GPU→CPU readbacks per frame.
+    cw->embed_host.resize((size_t) cw->num_acoustic_codebooks);
+    for (int g = 0; g < cw->num_acoustic_codebooks; g++) {
+        struct ggml_tensor * t = cw->codec_embedding[(size_t) g];
+        cw->embed_host[(size_t) g].resize(
+            (size_t) cw->vocab_size * (size_t) cw->hidden_size);
+
+        if (t->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_get(t, cw->embed_host[(size_t) g].data(), 0,
+                                    ggml_nbytes(t));
+        } else {
+            // Quantized: read raw bytes then dequantize row by row.
+            const struct ggml_type_traits * tt = ggml_get_type_traits(t->type);
+            const size_t row_bytes = ggml_row_size(t->type, cw->hidden_size);
+            std::vector<uint8_t> tmp(row_bytes);
+            for (int r = 0; r < cw->vocab_size; r++) {
+                ggml_backend_tensor_get(t, tmp.data(), (size_t) r * row_bytes, row_bytes);
+                tt->to_float(tmp.data(),
+                             cw->embed_host[(size_t) g].data() + (size_t) r * (size_t) cw->hidden_size,
+                             cw->hidden_size);
+            }
+        }
+    }
+
+    // Pre-compute causal masks for all T_full values (2..16). The mask
+    // is [T_full, T] F16 with -inf for future positions. For decode
+    // steps T=1, the mask is just [T_full, 1] with all zeros (no
+    // masking needed for single-token decode). For prefill T=2, the
+    // mask is [2, 2] with upper triangle -inf.
+    // Index: masks[T_full - 2] -> flat [T_full * T_full] buffer.
+    {
+        const ggml_fp16_t zero    = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+        cw->causal_masks.resize(15);  // T_full = 2..16
+        for (int tf = 2; tf <= 16; tf++) {
+            cw->causal_masks[(size_t) (tf - 2)].resize((size_t) tf * (size_t) tf, neg_inf);
+            for (int q = 0; q < tf; q++) {
+                for (int k = 0; k <= q && k < tf; k++) {
+                    cw->causal_masks[(size_t) (tf - 2)][(size_t) q * (size_t) tf + (size_t) k] = zero;
+                }
+            }
+        }
+    }
+
+    // Pre-allocate the graph context buffer. ~304 nodes for the 5-layer
+    // predictor graph; 8192 gives headroom.
+    {
+        const int    max_nodes   = 48 * cw->num_hidden_layers + 64;
+        const size_t ctx_size    = ggml_tensor_overhead() * (size_t) max_nodes +
+                           ggml_graph_overhead_custom((size_t) max_nodes, false);
+        cw->ctx_buffer.assign(ctx_size, 0);
+    }
+
     fprintf(stderr,
             "[CodePredictor] Loaded: %d layers, hidden %d, heads %d/%d, head_dim %d, "
             "FFN %d, RoPE theta %.0f, %d acoustic codebooks (vocab %d each), mtp_proj %s\n",
             cw->num_hidden_layers, cw->hidden_size, cw->num_attention_heads, cw->num_key_value_heads, cw->head_dim,
             cw->intermediate_size, (double) cw->rope_theta, cw->num_acoustic_codebooks, cw->vocab_size,
             cw->mtp_proj_w ? "linear" : "identity");
+    fprintf(stderr,
+            "[CodePredictor] CPU cache: %d embed tables (%d rows x %d dim F32 each), %d causal masks, ctx %.1f KB\n",
+            cw->num_acoustic_codebooks, cw->vocab_size, cw->hidden_size,
+            15, (float) cw->ctx_buffer.size() / 1024.0f);
     return true;
 }
 
@@ -178,4 +260,7 @@ static void code_predictor_weights_free(CodePredictorWeights * cw) {
     cw->layers.clear();
     cw->codec_embedding.clear();
     cw->lm_head.clear();
+    cw->embed_host.clear();
+    cw->causal_masks.clear();
+    cw->ctx_buffer.clear();
 }

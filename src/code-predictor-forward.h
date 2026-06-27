@@ -197,9 +197,10 @@ static bool code_predictor_run(const CodePredictorWeights * cw,
     const int T_full   = n_past + T;
 
     const int    max_nodes   = 48 * n_layers + 64;
-    const size_t arena_bytes = ggml_tensor_overhead() * max_nodes + ggml_graph_overhead_custom(max_nodes, false);
+    // const size_t arena_bytes = ggml_tensor_overhead() * max_nodes + ggml_graph_overhead_custom(max_nodes, false);
 
-    struct ggml_init_params gp   = { arena_bytes, NULL, true };
+    // Use pre-allocated context buffer from load time.
+    struct ggml_init_params gp   = { cw->ctx_buffer.size(), const_cast<uint8_t *>(cw->ctx_buffer.data()), true };
     struct ggml_context *   gctx = ggml_init(gp);
     if (!gctx) {
         fprintf(stderr, "[CodePredictor] FATAL: ggml_init failed\n");
@@ -259,16 +260,17 @@ static bool code_predictor_run(const CodePredictorWeights * cw,
     }
 
     {
+        // Use pre-computed causal mask from load time. The cached mask
+        // is [T_full, T_full] square; we extract the [T, T_full] slice
+        // for the current query positions (n_past..n_past+T-1).
+        const int cache_idx = T_full - 2;  // T_full ranges 2..16
+        const std::vector<cp_fp16_t> & cached = cw->causal_masks[(size_t) cache_idx];
+
         std::vector<ggml_fp16_t> mask((size_t) T * (size_t) T_full);
-        const ggml_fp16_t        zero    = ggml_fp32_to_fp16(0.0f);
-        const ggml_fp16_t        neg_inf = ggml_fp32_to_fp16(-INFINITY);
-        for (size_t i = 0; i < mask.size(); i++) {
-            mask[i] = neg_inf;
-        }
         for (int q = 0; q < T; q++) {
-            const int q_pos = n_past + q;
-            for (int k = 0; k <= q_pos; k++) {
-                mask[(size_t) q * (size_t) T_full + (size_t) k] = zero;
+            for (int k = 0; k < T_full; k++) {
+                mask[(size_t) q * (size_t) T_full + (size_t) k] =
+                    ggml_fp16_t{ cached[(size_t) (n_past + q) * (size_t) T_full + (size_t) k] };
             }
         }
         ggml_backend_tensor_set(mask_in, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
@@ -382,10 +384,13 @@ static bool code_predictor_step(const TalkerWeights *        tw,
 
     // Decode loop: 14 single-token steps. At step g (g=1..14) we feed
     // the embedding of the code we just sampled and read lm_head[g].
+    // Use pre-loaded CPU embedding tables to avoid GPU→CPU readbacks.
     std::vector<float> step_input((size_t) talker_hidden);
     for (int g = 1; g < n_acoustic; g++) {
-        embed_row_from_backend(cw->codec_embedding[(size_t) (g - 1)], out->codes[(size_t) g], talker_hidden,
-                               step_input.data());
+        const int row = out->codes[(size_t) g];
+        std::memcpy(step_input.data(),
+                    cw->embed_host[(size_t) (g - 1)].data() + (size_t) row * (size_t) talker_hidden,
+                    (size_t) talker_hidden * sizeof(float));
         if (!code_predictor_run(cw, kv, sched, step_input.data(), 1, kv->cur_len, talker_hidden, g, use_flash_attn,
                                 clamp_fp16, &logits)) {
             return false;
