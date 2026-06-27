@@ -50,18 +50,15 @@ static bool speaker_encoder_extract(const SpeakerEncoderWeights * sw,
         return false;
     }
 
-    AudioMelConfig mel_cfg;
-    mel_cfg.sample_rate = sw->sample_rate;
-    mel_cfg.n_fft       = 1024;
-    mel_cfg.hop         = 256;
-    mel_cfg.n_mels      = sw->mel_dim;
-    mel_cfg.fmin        = 0.0f;
-    mel_cfg.fmax        = 12000.0f;
+    // Use cached mel constants from load time. The config is fixed by
+    // the model so there is no need to recompute per call.
+    const AudioMelConfig &    mel_cfg_cached = sw->mel_cfg;
+    const AudioMelConstants & mel_c          = sw->mel_constants;
 
     const int     T_in = n_samples;
     const float * raw  = audio;
 
-    const int pad   = (mel_cfg.n_fft - mel_cfg.hop) / 2;  // 384
+    const int pad   = (mel_cfg_cached.n_fft - mel_cfg_cached.hop) / 2;  // 384
     const int T_pad = T_in + 2 * pad;
     if (T_in < pad + 1) {
         fprintf(stderr, "[SpkExtract] FATAL: audio too short (%d samples) for reflect pad %d\n", T_in, pad);
@@ -80,27 +77,20 @@ static bool speaker_encoder_extract(const SpeakerEncoderWeights * sw,
         audio_padded[(size_t) (pad + T_in + i)] = raw[T_in - 2 - i];
     }
 
-    // Bake CPU constants once per call: Hann, DFT, mel basis. The cost
-    // is dominated by the DFT precompute which is 524 KB of f32.
-    AudioMelConstants mel_c;
-    audio_mel_compute_constants(mel_cfg, mel_c);
-
-    // Build the graph context. mel + ECAPA accounts for ~150 nodes per
-    // SE-Res2Net block + 30 for the mel front end + 60 for ASP and FC.
-    // 2048 nodes is a comfortable upper bound.
-    const size_t     mem_size  = ggml_tensor_overhead() * 4096 + ggml_graph_overhead_custom(2048, false);
+    // Build the graph context using the pre-allocated buffer. This avoids
+    // a malloc/free pair on every extraction call.
     ggml_init_params init      = {};
-    init.mem_size              = mem_size;
-    init.mem_buffer            = NULL;
+    init.mem_size              = sw->ctx_buffer.size();
+    init.mem_buffer            = const_cast<uint8_t *>(sw->ctx_buffer.data());
     init.no_alloc              = true;
     struct ggml_context * gctx = ggml_init(init);
 
     // Graph inputs: audio waveform and 4 mel constants.
     struct ggml_tensor * audio_in  = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, T_pad);
-    struct ggml_tensor * hann_in   = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, mel_cfg.n_fft);
-    struct ggml_tensor * dft_re_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, mel_cfg.n_fft, mel_c.n_freq);
-    struct ggml_tensor * dft_im_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, mel_cfg.n_fft, mel_c.n_freq);
-    struct ggml_tensor * mel_b_in  = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, mel_c.n_freq, mel_cfg.n_mels);
+    struct ggml_tensor * hann_in   = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, mel_cfg_cached.n_fft);
+    struct ggml_tensor * dft_re_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, mel_cfg_cached.n_fft, mel_c.n_freq);
+    struct ggml_tensor * dft_im_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, mel_cfg_cached.n_fft, mel_c.n_freq);
+    struct ggml_tensor * mel_b_in  = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, mel_c.n_freq, mel_cfg_cached.n_mels);
     ggml_set_name(audio_in, "spk.audio_padded");
     ggml_set_name(hann_in, "spk.hann");
     ggml_set_name(dft_re_in, "spk.dft_real");
@@ -127,7 +117,7 @@ static bool speaker_encoder_extract(const SpeakerEncoderWeights * sw,
     struct ggml_tensor * asp_t      = NULL;
     struct ggml_tensor * asp_dump   = NULL;
     struct ggml_tensor * emb = speaker_encoder_forward(gctx, sw, audio_in, hann_in, dft_re_in, dft_im_in, mel_b_in,
-                                                       mel_cfg, &mel_t, &mag_t, &front_t, &blk3_t, &mfa_t, &asp_t);
+                                                       mel_cfg_cached, &mel_t, &mag_t, &front_t, &blk3_t, &mfa_t, &asp_t);
     ggml_set_output(emb);
     if (dump_dir && mel_t) {
         // mel_t has ggml ne=(n_mels, T_frames), which streams row-major
@@ -241,8 +231,8 @@ static bool speaker_encoder_extract(const SpeakerEncoderWeights * sw,
         // librosa.filters.mel produced by the Python upstream. Layouts
         // are kept as numpy [n_fft] for hann and [n_mels, n_freq] for
         // mel_basis, matching the librosa convention.
-        debug_dump_1d(&d, "mel-hann", mel_c.hann.data(), mel_cfg.n_fft);
-        debug_dump_2d(&d, "mel-basis", mel_c.mel_basis.data(), mel_cfg.n_mels, mel_c.n_freq);
+        debug_dump_1d(&d, "mel-hann", mel_c.hann.data(), mel_cfg_cached.n_fft);
+        debug_dump_2d(&d, "mel-basis", mel_c.mel_basis.data(), mel_cfg_cached.n_mels, mel_c.n_freq);
 
         if (mag_dump) {
             size_t             nm = ggml_nelements(mag_dump);

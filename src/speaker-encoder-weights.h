@@ -20,6 +20,7 @@
 // res2net scale 8 -> 7 dilated TDNN branches, se hidden 128,
 // asp attention 128.
 
+#include "audio-mel.h"
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "gguf-weights.h"
@@ -102,6 +103,17 @@ struct SpeakerEncoderWeights {
 
     struct ggml_context * weight_ctx;
     ggml_backend_buffer_t weight_buf;
+
+    // Cached mel constants: computed once at load time, reused across
+    // every speaker_encoder_extract call. Avoids ~5 MB of vector alloc
+    // and ~525 K trig evaluations per extraction.
+    AudioMelConfig    mel_cfg;
+    AudioMelConstants mel_constants;
+
+    // Pre-allocated context buffer for the extract graph. Reused across
+    // calls to avoid malloc/free overhead in ggml_init. The size covers
+    // the full mel + ECAPA graph (~2048 nodes) with headroom.
+    std::vector<uint8_t> ctx_buffer;
 };
 
 // Helpers to load each tensor by upstream name. The generic gf_load_tensor
@@ -188,6 +200,21 @@ static bool speaker_encoder_weights_load(SpeakerEncoderWeights * sw, const GGUFM
     }
     sw->weight_ctx = wctx.ctx;
     sw->weight_buf = wctx.buffer;
+
+    // Pre-compute mel constants once at load time. The config is fixed
+    // by the upstream model (sr=24000, n_fft=1024, hop=256, n_mels=128).
+    sw->mel_cfg.sample_rate = sw->sample_rate;
+    sw->mel_cfg.n_fft       = 1024;
+    sw->mel_cfg.hop         = 256;
+    sw->mel_cfg.n_mels      = sw->mel_dim;
+    sw->mel_cfg.fmin        = 0.0f;
+    sw->mel_cfg.fmax        = 12000.0f;
+    audio_mel_compute_constants(sw->mel_cfg, sw->mel_constants);
+
+    // Pre-allocate the graph context buffer. ~2048 nodes for the full
+    // mel + ECAPA graph; 8192 gives comfortable headroom for debug dumps.
+    const size_t ctx_size = ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(4096, false);
+    sw->ctx_buffer.assign(ctx_size, 0);
 
     fprintf(stderr,
             "[SpeakerEncoder] Loaded: enc_dim=%d sr=%d mel_dim=%d hidden=%d mfa=%d asp_attn=%d se=%d scale=%d\n",
