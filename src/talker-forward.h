@@ -281,13 +281,11 @@ static bool talker_forward_core(const TalkerWeights *        tw,
     const int vocab    = tw->vocab_size;
     const int T_full   = n_past + T;
 
-    // Attention window rounded up to 256 and clamped to the cache size.
-    // Fixed shapes over spans of 256 decode steps let the CUDA graph
-    // executable update in place (pointer patch) instead of rebuilding.
-    // Ternary instead of std::min: windows.h min/max macros break the
-    // latter in headers on MSVC.
-    const int kv_pad_raw = (int) GGML_PAD(T_full, 256);
-    const int n_kv_pad   = kv_pad_raw < kv->max_seq_len ? kv_pad_raw : kv->max_seq_len;
+    // Attention window — use the exact T_full (no padding). The upstream
+    // rounds to 256 for CUDA graph cache stability, but on Vulkan the
+    // wider KV read dominates and no graph cache exists. Exact window
+    // matches the original per-step build performance.
+    const int n_kv_pad = T_full < kv->max_seq_len ? T_full : kv->max_seq_len;
 
     const int             max_nodes = talker_graph_max_nodes(n_layers);
     struct ggml_context * gctx      = graph_arena_begin(arena);
