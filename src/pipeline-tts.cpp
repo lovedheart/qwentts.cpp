@@ -570,11 +570,10 @@ qt_status pipeline_tts_synthesize(PipelineTTS *                pt,
     // sample (one for c0 of each step, then 15 for the predictor codes).
     int64_t subseq_counter = 0;
 
-    // Decode input state: the codes sampled at the previous frame plus
-    // the trailing text / pad overlay row for that frame. The talker
-    // decode graph gathers and sums the 16 embeddings on device.
-    std::vector<int32_t> prev_ids((size_t) num_codebooks, 0);
-    const float *        prev_overlay = NULL;
+    // Decode input state: the summed 16-code embedding plus text/pad
+    // overlay computed on CPU each frame and uploaded as a single
+    // [hidden] tensor to the talker decode graph.
+    std::vector<float> next_emb((size_t) hidden, 0.0f);
 
     // Streaming rolling decoder. Holds the K major codes buffer, the
     // emit cursor and the left context window. push_frame triggers an
@@ -607,10 +606,8 @@ qt_status pipeline_tts_synthesize(PipelineTTS *                pt,
             ok = talker_forward_prefill(&pt->talker, &pt->talker_kv, pt->sched, &pt->talker_arena,
                                         prompt.input_embed.data(), prompt.T_ctx, use_fa, clamp_fp16, step_dump, &fw);
         } else {
-            ok =
-                talker_forward_decode(&pt->talker, &pt->talker_kv, pt->sched, &pt->talker_arena, prev_ids.data(),
-                                      pt->code_predictor.codec_embedding.data(),
-                                      pt->code_predictor.num_acoustic_codebooks, prev_overlay, use_fa, clamp_fp16, &fw);
+            ok = talker_forward_decode(&pt->talker, &pt->talker_kv, pt->sched, &pt->talker_arena, next_emb.data(),
+                                       use_fa, clamp_fp16, &fw);
         }
         if (!ok) {
             return QT_STATUS_GENERATE_FAILED;
@@ -694,25 +691,14 @@ qt_status pipeline_tts_synthesize(PipelineTTS *                pt,
             }
         }
 
-        // Next decode input: the 16 frame codes gather and sum in graph
-        // (codebook 0 from talker.codec_embedding, the 15 acoustic
-        // groups from the predictor's private tables). The overlay row
-        // adds the next utterance text hidden while any remains, the
-        // tts_pad embedding afterwards.
-        prev_ids[0] = c0;
-        for (int g = 1; g < num_codebooks; g++) {
-            prev_ids[(size_t) g] = cp.codes[(size_t) g];
-        }
-        prev_overlay = (step < prompt.T_trailing) ?
-                           prompt.trailing_text_hidden.data() + (size_t) step * (size_t) hidden :
-                           prompt.tts_pad_embed.data();
-
-        // Bisection dump: reproduce the in graph composition on host so
-        // the step 0 next embedding stays byte comparable against the
-        // Python hook (codebook sums plus trailing text overlay).
-        if (params->dump_dir && step == 0) {
-            std::vector<float> next_emb((size_t) hidden, 0.0f);
+        // Build next-token embedding on CPU: sum of 16 codec embeddings
+        // plus trailing text / pad overlay. The talker decode graph
+        // receives this as a single [hidden] tensor upload, avoiding
+        // ~32 extra Vulkan kernel dispatches per frame.
+        {
+            Timer t_emb;
             std::vector<float> tmp((size_t) hidden);
+            std::fill(next_emb.begin(), next_emb.end(), 0.0f);
             embed_row_from_gguf(pt->gguf_talker, "talker.codec_embd.weight", c0, hidden, tmp.data());
             for (int i = 0; i < hidden; i++) {
                 next_emb[(size_t) i] += tmp[(size_t) i];
@@ -726,9 +712,18 @@ qt_status pipeline_tts_synthesize(PipelineTTS *                pt,
                     next_emb[(size_t) i] += tmp[(size_t) i];
                 }
             }
+            const float * overlay = (step < prompt.T_trailing) ?
+                                        prompt.trailing_text_hidden.data() + (size_t) step * (size_t) hidden :
+                                        prompt.tts_pad_embed.data();
             for (int i = 0; i < hidden; i++) {
-                next_emb[(size_t) i] += prev_overlay[(size_t) i];
+                next_emb[(size_t) i] += overlay[(size_t) i];
             }
+            perf.host_ms += t_emb.ms();
+        }
+
+        // Bisection dump: reproduce the next-emb composition for byte
+        // comparison against the Python hook.
+        if (params->dump_dir && step == 0) {
             DebugDumper d;
             debug_init(&d, params->dump_dir);
             debug_dump_1d(&d, "next-emb-step0", next_emb.data(), hidden);

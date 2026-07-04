@@ -261,17 +261,13 @@ static struct ggml_tensor * talker_layer_forward(struct ggml_context * ctx,
 // the prefill path. use_fa / clamp_fp16 are forwarded as is to every
 // layer. The graph metadata lives in the caller owned persistent
 // arena.
-static bool talker_forward_core(const TalkerWeights *        tw,
-                                KVCache *                    kv,
-                                ggml_backend_sched_t         sched,
-                                GraphArena *                 arena,
-                                const float *                input_embed,
-                                const int32_t *              frame_ids,
-                                struct ggml_tensor * const * acoustic_embd,
-                                int                          n_acoustic,
-                                const float *                overlay,
-                                int                          T,
-                                int                          n_past,
+static bool talker_forward_core(const TalkerWeights * tw,
+                                KVCache *             kv,
+                                ggml_backend_sched_t  sched,
+                                GraphArena *          arena,
+                                const float *         input_embed,
+                                int                   T,
+                                int                   n_past,
                                 bool                         use_flash_attn,
                                 bool                         clamp_fp16,
                                 const char *                 dump_dir,
@@ -300,32 +296,12 @@ static bool talker_forward_core(const TalkerWeights *        tw,
     ggml_set_name(mask_in, "causal_mask");
 
     // Input: either a raw embedding upload (prefill path) or, on the
-    // decode hot path, the frame codes of the previous step gathered
-    // and summed in graph. x = get_rows(codec_embd, ids[0]) plus the 15
-    // acoustic group gathers plus the trailing text / pad overlay row.
-    // The only per step uploads are 16 code ids and one overlay row.
-    struct ggml_tensor * x_in       = NULL;
-    struct ggml_tensor * ids_in     = NULL;
-    struct ggml_tensor * overlay_in = NULL;
-    if (frame_ids) {
-        ids_in = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, 1 + n_acoustic);
-        ggml_set_name(ids_in, "frame_code_ids");
-        ggml_set_input(ids_in);
-        overlay_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, hidden, 1);
-        ggml_set_name(overlay_in, "overlay_row");
-        ggml_set_input(overlay_in);
-
-        struct ggml_tensor * id0 = ggml_view_1d(gctx, ids_in, 1, 0);
-        x_in                     = ggml_get_rows(gctx, tw->codec_embedding, id0);
-        for (int g = 0; g < n_acoustic; g++) {
-            struct ggml_tensor * idg = ggml_view_1d(gctx, ids_in, 1, (size_t) (g + 1) * sizeof(int32_t));
-            x_in                     = ggml_add(gctx, x_in, ggml_get_rows(gctx, acoustic_embd[g], idg));
-        }
-        x_in = ggml_add(gctx, x_in, overlay_in);
-    } else {
-        x_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, hidden, T);
-        ggml_set_input(x_in);
-    }
+    // decode hot path, a pre-computed next_emb (sum of 16 code
+    // embeddings + overlay, assembled on CPU). We skip the upstream's
+    // in-graph get_rows/add chain here because on Vulkan each extra
+    // kernel dispatch adds measurable overhead and no graph cache exists.
+    struct ggml_tensor * x_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, hidden, T);
+    ggml_set_input(x_in);
     ggml_set_name(x_in, "input_embed");
 
     struct ggml_cgraph * gf = ggml_new_graph_custom(gctx, max_nodes, false);
@@ -378,12 +354,7 @@ static bool talker_forward_core(const TalkerWeights *        tw,
     }
 
     // Upload input embedding (host [T, hidden] -> ggml [hidden, T]).
-    if (frame_ids) {
-        ggml_backend_tensor_set(ids_in, frame_ids, 0, (size_t) (1 + n_acoustic) * sizeof(int32_t));
-        ggml_backend_tensor_set(overlay_in, overlay, 0, (size_t) hidden * sizeof(float));
-    } else {
-        ggml_backend_tensor_set(x_in, input_embed, 0, (size_t) T * (size_t) hidden * sizeof(float));
-    }
+    ggml_backend_tensor_set(x_in, input_embed, 0, (size_t) T * (size_t) hidden * sizeof(float));
 
     // Positions: n_past .. n_past + T - 1
     {
@@ -481,25 +452,19 @@ static bool talker_forward_prefill(const TalkerWeights * tw,
         fprintf(stderr, "[TalkerForward] FATAL: prefill T=%d exceeds cache max_seq_len=%d\n", T, kv->max_seq_len);
         return false;
     }
-    return talker_forward_core(tw, kv, sched, arena, input_embed, NULL, NULL, 0, NULL, T, 0, use_flash_attn, clamp_fp16,
+    return talker_forward_core(tw, kv, sched, arena, input_embed, T, 0, use_flash_attn, clamp_fp16,
                                dump_dir, out);
 }
 
-// Decode: feed exactly one embedding and append one position to the
-// cache. Reads positions [0, kv->cur_len + 1). Caller is responsible
-// for ensuring kv->cur_len + 1 <= kv->max_seq_len.
-// Append one position from the previous frame's codes. frame_ids holds
-// [c0, c1..c15], acoustic_embd the 15 group tables owned by the code
-// predictor, overlay the trailing text / pad row summed on top. The
-// input embedding assembles entirely in graph.
-static bool talker_forward_decode(const TalkerWeights *        tw,
-                                  KVCache *                    kv,
-                                  ggml_backend_sched_t         sched,
-                                  GraphArena *                 arena,
-                                  const int32_t *              frame_ids,
-                                  struct ggml_tensor * const * acoustic_embd,
-                                  int                          n_acoustic,
-                                  const float *                overlay,
+// Decode: feed exactly one pre-computed embedding and append one
+// position to the cache. next_emb is the [hidden] f32 sum of 16
+// codec embeddings plus the trailing text / pad overlay, assembled
+// on CPU by pipeline-tts.cpp.
+static bool talker_forward_decode(const TalkerWeights * tw,
+                                  KVCache *             kv,
+                                  ggml_backend_sched_t  sched,
+                                  GraphArena *          arena,
+                                  const float *         next_emb,
                                   bool                         use_flash_attn,
                                   bool                         clamp_fp16,
                                   TalkerForwardOutput *        out) {
@@ -508,6 +473,5 @@ static bool talker_forward_decode(const TalkerWeights *        tw,
                 kv->max_seq_len);
         return false;
     }
-    return talker_forward_core(tw, kv, sched, arena, NULL, frame_ids, acoustic_embd, n_acoustic, overlay, 1,
-                               kv->cur_len, use_flash_attn, clamp_fp16, NULL, out);
+    return talker_forward_core(tw, kv, sched, arena, next_emb, 1, kv->cur_len, use_flash_attn, clamp_fp16, NULL, out);
 }
