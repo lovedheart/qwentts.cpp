@@ -11,6 +11,7 @@
 #include "causal-trans-conv.h"
 #include "debug.h"
 #include "qt-error.h"
+#include "timer.h"
 
 #include <cmath>
 #include <cstdio>
@@ -73,51 +74,9 @@ bool pipeline_codec_load(PipelineCodec * pc, const char * gguf_path, BackendPair
         pc->pre_conv_wctx = std::move(wctx);
     }
 
-    if (!seanet_encoder_load(&pc->seanet, pc->gguf, pc->backend)) {
-        wctx_free(&pc->pre_conv_wctx);
-        dac_decoder_free(&pc->dac);
-        upsample_stage_free(&pc->upsample);
-        tok_trans_free(&pc->transformer);
-        quant_decoder_free(&pc->qdec);
-        gf_close(&pc->gguf);
-        return false;
-    }
-
-    if (!enc_trans_load(&pc->enc_transformer, pc->gguf, pc->backend)) {
-        seanet_encoder_free(&pc->seanet);
-        wctx_free(&pc->pre_conv_wctx);
-        dac_decoder_free(&pc->dac);
-        upsample_stage_free(&pc->upsample);
-        tok_trans_free(&pc->transformer);
-        quant_decoder_free(&pc->qdec);
-        gf_close(&pc->gguf);
-        return false;
-    }
-
-    if (!enc_down_load(&pc->enc_downsample, pc->gguf, pc->backend)) {
-        enc_trans_free(&pc->enc_transformer);
-        seanet_encoder_free(&pc->seanet);
-        wctx_free(&pc->pre_conv_wctx);
-        dac_decoder_free(&pc->dac);
-        upsample_stage_free(&pc->upsample);
-        tok_trans_free(&pc->transformer);
-        quant_decoder_free(&pc->qdec);
-        gf_close(&pc->gguf);
-        return false;
-    }
-
-    if (!quant_encode_load(&pc->qenc, pc->gguf, pc->backend)) {
-        enc_down_free(&pc->enc_downsample);
-        enc_trans_free(&pc->enc_transformer);
-        seanet_encoder_free(&pc->seanet);
-        wctx_free(&pc->pre_conv_wctx);
-        dac_decoder_free(&pc->dac);
-        upsample_stage_free(&pc->upsample);
-        tok_trans_free(&pc->transformer);
-        quant_decoder_free(&pc->qdec);
-        gf_close(&pc->gguf);
-        return false;
-    }
+    // Encoder half (seanet, enc_transformer, enc_downsample, qenc)
+    // stays on disk until the first encode request.
+    pc->enc_loaded = false;
 
     pc->sched = backend_sched_new(bp, 4096);
 
@@ -217,10 +176,44 @@ std::vector<float> pipeline_codec_decode(PipelineCodec * pc, const int32_t * cod
     return audio;
 }
 
+bool pipeline_codec_ensure_encoder(PipelineCodec * pc) {
+    if (pc->enc_loaded) {
+        return true;
+    }
+
+    Timer t_load;
+    if (!seanet_encoder_load(&pc->seanet, pc->gguf, pc->backend)) {
+        return false;
+    }
+    if (!enc_trans_load(&pc->enc_transformer, pc->gguf, pc->backend)) {
+        seanet_encoder_free(&pc->seanet);
+        return false;
+    }
+    if (!enc_down_load(&pc->enc_downsample, pc->gguf, pc->backend)) {
+        enc_trans_free(&pc->enc_transformer);
+        seanet_encoder_free(&pc->seanet);
+        return false;
+    }
+    if (!quant_encode_load(&pc->qenc, pc->gguf, pc->backend)) {
+        enc_down_free(&pc->enc_downsample);
+        enc_trans_free(&pc->enc_transformer);
+        seanet_encoder_free(&pc->seanet);
+        return false;
+    }
+
+    pc->enc_loaded = true;
+    qt_log(QT_LOG_INFO, "[Pipeline] Codec encoder lazy loaded in %.0f ms", t_load.ms());
+    return true;
+}
+
 std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc,
                                            const float *   audio,
                                            int             n_samples,
                                            const char *    dump_dir) {
+    if (!pipeline_codec_ensure_encoder(pc)) {
+        qt_log(QT_LOG_ERROR, "[Pipeline] codec encoder load failed");
+        return {};
+    }
     if (n_samples <= 0 || (n_samples % TOKENIZER_HOP_LENGTH) != 0) {
         qt_log(QT_LOG_ERROR, "[Pipeline] n_samples must be a positive multiple of %d (got %d)", TOKENIZER_HOP_LENGTH,
                n_samples);
@@ -434,10 +427,13 @@ void pipeline_codec_free(PipelineCodec * pc) {
         ggml_backend_sched_free(pc->sched);
         pc->sched = NULL;
     }
-    quant_encode_free(&pc->qenc);
-    enc_down_free(&pc->enc_downsample);
-    enc_trans_free(&pc->enc_transformer);
-    seanet_encoder_free(&pc->seanet);
+    if (pc->enc_loaded) {
+        quant_encode_free(&pc->qenc);
+        enc_down_free(&pc->enc_downsample);
+        enc_trans_free(&pc->enc_transformer);
+        seanet_encoder_free(&pc->seanet);
+        pc->enc_loaded = false;
+    }
     wctx_free(&pc->pre_conv_wctx);
     dac_decoder_free(&pc->dac);
     upsample_stage_free(&pc->upsample);

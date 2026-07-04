@@ -504,6 +504,10 @@ Optional:
                           CustomVoice, rejected for Base
   --speaker <name>        Speaker name (CustomVoice only)
   --ref-wav <path>        Reference WAV for voice cloning (Base only)
+  --ref-spk <path>        Pre-extracted speaker embedding from qwen-codec --talker
+                          (replaces --ref-wav, Base only)
+  --ref-rvq <path>        Pre-encoded reference codes from qwen-codec (requires
+                          --ref-spk and --ref-text, enables ICL clone mode)
   --ref-text <path>       Transcript file for the reference (enables ICL clone mode)
   --max-new <n>           Max new audio frames (default: 2048)
   --codec-chunk-dur <f>   Codec decode chunk duration in seconds (default: 24.0)
@@ -532,16 +536,20 @@ Debug:
 Verbatim `--help` :
 
 ```
-Usage: ./build/qwen-codec --model <gguf> [-i <input>] [--format <fmt>]
+Usage: ./build/qwen-codec --model <gguf> [-i <input>] [--talker <gguf>] [--format <fmt>]
 
 Required:
   --model <gguf>          Codec GGUF (qwen-tokenizer-12hz-*.gguf)
 
 Optional:
   -i <path>               Input. WAV -> encode, .rvq -> decode
+  --talker <gguf>         Talker GGUF (Base only). Encode also extracts the speaker
+                          embedding and writes it next to the .rvq as a .spk file
   --format <fmt>          WAV output format: wav16, wav24, wav32 (default: wav16)
 
 Output is auto-named next to input : clip.wav -> clip.rvq, clip.rvq -> clip.wav.
+Encode truncates to the hop boundary, conforming to the qwen-tts --ref-wav path:
+the .rvq feeds qwen-tts --ref-rvq, the .spk feeds qwen-tts --ref-spk.
 When -i is omitted, runs a load self-test of the codec GGUF.
 ```
 

@@ -14,6 +14,7 @@
 #include "code-predictor-weights.h"
 #include "ggml-backend.h"
 #include "gguf-weights.h"
+#include "graph-arena.h"
 #include "kv-cache.h"
 #include "pipeline-codec.h"
 #include "qwen.h"
@@ -94,6 +95,10 @@ struct PipelineTTS {
     SpeakerEncoderWeights speaker_encoder;
     bool                  has_speaker_encoder;
 
+    // Speaker encoder weights residency: loaded lazily on the first
+    // reference audio request, see pipeline-tts.cpp.
+    bool spk_enc_loaded;
+
     PipelineCodec codec;
 
     std::string tokenizer_type;
@@ -126,6 +131,15 @@ struct PipelineTTS {
     // frame in code_predictor_step.
     KVCache talker_kv;
     KVCache code_predictor_kv;
+
+    // Persistent graph arenas, one per graph shape class. Stable node
+    // addresses across rebuilds keep the backend CUDA graph cache hot:
+    // the talker shares one arena for prefill and decode, the predictor
+    // splits prefill (T=2) and step (T=1) so the two flavors that
+    // alternate within a frame each keep their own executable.
+    GraphArena talker_arena;
+    GraphArena cp_prefill_arena;
+    GraphArena cp_step_arena;
 };
 
 // Open the talker GGUF and the codec GGUF, load every module on the

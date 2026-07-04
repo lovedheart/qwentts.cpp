@@ -112,6 +112,26 @@ struct codec_chunked_decoder_stream {
         by_k.assign((size_t) K, {});
     }
 
+    // Seed the left context with the tail of the ICL reference codes so
+    // the first emitted chunk draws causal context from the reference
+    // instead of an empty decoder state, matching the upstream pipeline
+    // which decodes reference plus generated then trims. ref_kt is K
+    // major [K, ref_T]; the last min(ref_T, left_ctx_frames) frames are
+    // kept. Call once, after init and before any push_frame; the seeded
+    // frames sit below emit_start_frame so they are never emitted.
+    void seed_reference(const int32_t * ref_kt, int ref_T) {
+        int seed = ref_T < left_ctx_frames ? ref_T : left_ctx_frames;
+        if (seed <= 0) {
+            return;
+        }
+        for (int k = 0; k < K; k++) {
+            const int32_t * row = ref_kt + (size_t) k * (size_t) ref_T + (size_t) (ref_T - seed);
+            by_k[(size_t) k].insert(by_k[(size_t) k].end(), row, row + seed);
+        }
+        T_so_far         = seed;
+        emit_start_frame = seed;
+    }
+
     // Append one frame (K int32 codes, one per codebook). Drain any
     // chunks that became emittable. Returns false on decode failure or
     // when cb returns false (cancellation).

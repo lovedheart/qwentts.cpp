@@ -63,7 +63,12 @@ struct PipelineCodec {
     QwenSEANetEncoder      seanet;
     QwenEncoderTransformer enc_transformer;
     QwenEncoderDownsample  enc_downsample;
-    QwenQuantizerEncode    qenc;
+
+    // Encoder weights (seanet, enc_transformer, enc_downsample, qenc)
+    // load lazily on the first pipeline_codec_encode call: synthesis
+    // from pre encoded reference codes never pays for them.
+    bool                enc_loaded;
+    QwenQuantizerEncode qenc;
 
     // CPU mirror of the RVQ encode side, lazy-loaded on first encode call.
     QwenQuantizerEncodeHost qenc_sem_host;
@@ -78,6 +83,10 @@ struct PipelineCodec {
 // Open the GGUF, load every module on the backend, build the scheduler.
 // On failure leaves the struct in a clean state and returns false.
 bool pipeline_codec_load(PipelineCodec * pc, const char * gguf_path, BackendPair bp);
+
+// Load the encoder weights on demand. Idempotent, called by
+// pipeline_codec_encode; harmless to call when already resident.
+bool pipeline_codec_ensure_encoder(PipelineCodec * pc);
 
 // Decode RVQ codes into a 24 kHz mono waveform.
 //   codes: flat int32 buffer, [K, T] row-major (T fastest).
