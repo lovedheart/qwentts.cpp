@@ -260,11 +260,14 @@ bool pipeline_tts_load(PipelineTTS * pt,
     }
 
     // KV caches, one set per slot: the talker holds the LM context up
-    // to 4096 positions (the longest ICL prompt observed is ~250 +
-    // max_new_tokens ~ 1500, so 4096 has 60% headroom). Predictor holds
-    // one frame of 16 sub-steps per slot.
+    // to 2560 positions (the longest ICL prompt observed is ~250 +
+    // default max_new_tokens 2048, so 2560 keeps headroom). Q8_0 on GPU
+    // (fattn is instantiated for q8_0-q8_0 K/V and set_rows quantizes
+    // F32 writes natively; head_dim 128 % QK8_0 32 == 0); F32 stays on
+    // CPU. Predictor holds one frame of 16 sub-steps per slot.
+    const enum ggml_type kv_type = pt->use_flash_attn ? GGML_TYPE_Q8_0 : GGML_TYPE_F32;
     if (!kv_cache_init(&pt->talker_kv, pt->talker.num_hidden_layers, pt->talker.num_key_value_heads,
-                       pt->talker.head_dim, 4096, pt->max_batch, pt->backend)) {
+                       pt->talker.head_dim, 2560, pt->max_batch, pt->backend, kv_type)) {
         ggml_backend_sched_free(pt->sched);
         pt->sched = NULL;
         pipeline_codec_free(&pt->codec);
