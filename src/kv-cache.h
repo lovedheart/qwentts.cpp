@@ -64,7 +64,8 @@ static bool kv_cache_init(KVCache *      kv,
                           int            head_dim,
                           int            max_seq_len,
                           int            n_sets,
-                          ggml_backend_t backend) {
+                          ggml_backend_t backend,
+                          enum ggml_type type = GGML_TYPE_F32) {
     kv->n_layers    = n_layers;
     kv->n_kv_heads  = n_kv_heads;
     kv->head_dim    = head_dim;
@@ -89,8 +90,8 @@ static bool kv_cache_init(KVCache *      kv,
     }
 
     for (int l = 0; l < n_layers; l++) {
-        kv->k4[(size_t) l] = ggml_new_tensor_4d(kv->ctx, GGML_TYPE_F32, head_dim, max_seq_len, n_kv_heads, n_sets);
-        kv->v4[(size_t) l] = ggml_new_tensor_4d(kv->ctx, GGML_TYPE_F32, head_dim, max_seq_len, n_kv_heads, n_sets);
+        kv->k4[(size_t) l] = ggml_new_tensor_4d(kv->ctx, type, head_dim, max_seq_len, n_kv_heads, n_sets);
+        kv->v4[(size_t) l] = ggml_new_tensor_4d(kv->ctx, type, head_dim, max_seq_len, n_kv_heads, n_sets);
         char name[64];
         snprintf(name, sizeof(name), "kv_k_l%d", l);
         ggml_set_name(kv->k4[(size_t) l], name);
@@ -122,11 +123,12 @@ static bool kv_cache_init(KVCache *      kv,
     // Zero-init the buffer so any out of bounds read returns a known value.
     ggml_backend_buffer_clear(kv->buffer, 0);
 
-    size_t bytes_per_layer =
-        (size_t) head_dim * (size_t) max_seq_len * (size_t) n_kv_heads * (size_t) n_sets * sizeof(float);
-    size_t total_mb = (size_t) (2 * n_layers) * bytes_per_layer / (1024 * 1024);
-    qt_log(QT_LOG_INFO, "[KVCache] Allocated: %d layers, %d KV heads, head_dim %d, max_seq_len %d, %d sets -> %zu MB",
-           n_layers, n_kv_heads, head_dim, max_seq_len, n_sets, total_mb);
+    const size_t elems_per_tensor =
+        (size_t) head_dim * (size_t) max_seq_len * (size_t) n_kv_heads * (size_t) n_sets;
+    size_t total_mb = (size_t) (2 * n_layers) * ggml_row_size(type, elems_per_tensor) / (1024 * 1024);
+    qt_log(QT_LOG_INFO,
+           "[KVCache] Allocated: %d layers, %d KV heads, head_dim %d, max_seq_len %d, %d sets, type %s -> %zu MB",
+           n_layers, n_kv_heads, head_dim, max_seq_len, n_sets, ggml_type_name(type), total_mb);
     return true;
 }
 
